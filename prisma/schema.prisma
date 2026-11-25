@@ -1,0 +1,266 @@
+// ============================================================
+// Окошко — online booking SaaS for beauty masters.
+// Stage 1: complete data model (MySQL 8).
+//
+// Key guarantees:
+//  - UNIQUE (masterId, startAt) on Appointment — hard protection
+//    against double booking at the same slot; overlapping slots with
+//    different start times are additionally blocked in the booking
+//    transaction (SELECT ... FOR UPDATE) in app code (stage 3).
+//  - UNIQUE (masterId, phone) on Client — one client card per phone
+//    per master.
+//  - priceRub / amountRub are whole rubles (Int) to avoid float math.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------- Enums ----------------
+
+enum Role {
+  MASTER // beauty master, owns the booking dashboard
+  ADMIN  // platform administrator
+}
+
+enum Plan {
+  FREE // 30 bookings / calendar month, 5 active services
+  PRO  // unlimited, client Telegram reminders, CSV export, no branding
+}
+
+enum AppointmentStatus {
+  PENDING   // created by client via public page, awaits master confirmation
+  CONFIRMED // confirmed by master (or auto-confirmed, see stage 3)
+  COMPLETED // took place
+  CANCELLED // cancelled by client or master
+  NO_SHOW   // client did not show up
+}
+
+enum AppointmentSource {
+  ONLINE // booked via public page /m/{slug}
+  MANUAL // added by the master in the dashboard
+}
+
+enum ReminderType {
+  CLIENT_24H  // reminder to the client, 24h before start
+  CLIENT_2H   // reminder to the client, 2h before start
+  MASTER_NEW  // instant notification to the master about a new booking
+}
+
+enum ReminderStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED // appointment cancelled before send time
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  CANCELLED
+  FAILED
+}
+
+enum PaymentPeriod {
+  MONTHLY // 390 RUB / month
+  YEARLY  // 3900 RUB / year
+}
+
+// ---------------- Models ----------------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  phone        String? // normalized +7XXXXXXXXXX
+  telegramId   String? @unique // Telegram user id (Login Widget)
+  role         Role     @default(MASTER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  masterProfile MasterProfile?
+
+  @@index([role])
+}
+
+model MasterProfile {
+  id          String  @id @default(cuid())
+  slug        String  @unique // public booking page: /m/{slug}
+  displayName String
+  bio         String  @db.Text
+  city        String?
+  address     String?
+  avatarUrl   String?
+  timezone    String  @default("Europe/Moscow") // IANA tz name
+
+  // Monetization state; a downgrade job (stage 6) flips PRO -> FREE
+  // when planExpiresAt passes and no successful payment extends it.
+  plan          Plan     @default(FREE)
+  planExpiresAt DateTime? // PRO valid until (trial or paid period end); null = FREE
+  trialUsedAt   DateTime? // when the 14-day PRO trial was activated
+
+  // Booking rules
+  bookingBufferMin Int @default(0) // mandatory gap between appointments
+  minNoticeHours   Int @default(2) // minimum lead time for online booking
+  maxDaysAhead     Int @default(60) // booking horizon, days
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  services      Service[]
+  workingHours  WorkingHours[]
+  timeOffs      TimeOff[]
+  clients       Client[]
+  appointments  Appointment[]
+  reminders     Reminder[]
+  payments      Payment[]
+  subscriptions Subscription[]
+
+  @@index([plan, planExpiresAt]) // for the downgrade scan
+}
+
+model Service {
+  id          String   @id @default(cuid())
+  masterId    String
+  name        String
+  description String?  @db.Text
+  durationMin Int // service duration in minutes
+  priceRub    Int // whole rubles
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  master       MasterProfile @relation(fields: [masterId], references: [id], onDelete: Cascade)
+  appointments Appointment[]
+
+  @@index([masterId, isActive, sortOrder])
+}
+
+// Multiple rows per weekday are allowed (split shifts with a lunch break).
+// weekday: 0 = Sunday ... 6 = Saturday.
+model WorkingHours {
+  id        String   @id @default(cuid())
+  masterId  String
+  weekday   Int
+  startTime DateTime @db.Time
+  endTime   DateTime @db.Time
+  isDayOff  Boolean  @default(false) // explicit day-off marker
+
+  master MasterProfile @relation(fields: [masterId], references: [id], onDelete: Cascade)
+
+  @@index([masterId, weekday])
+}
+
+model TimeOff {
+  id       String   @id @default(cuid())
+  masterId String
+  startAt  DateTime // timezone = master.timezone
+  endAt    DateTime
+  reason   String?
+
+  master MasterProfile @relation(fields: [masterId], references: [id], onDelete: Cascade)
+
+  @@index([masterId, startAt, endAt])
+}
+
+model Client {
+  id             String   @id @default(cuid())
+  masterId       String
+  name           String
+  phone          String // normalized +7XXXXXXXXXX
+  telegramChatId String? // set when the client binds via /start TOKEN
+  telegramId     String?
+  note           String? @db.Text
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  master       MasterProfile @relation(fields: [masterId], references: [id], onDelete: Cascade)
+  appointments Appointment[]
+
+  @@unique([masterId, phone]) // one card per phone per master
+  @@index([masterId, name])
+  @@index([telegramChatId])
+}
+
+model Appointment {
+  id         String             @id @default(cuid())
+  masterId   String
+  clientId   String
+  serviceId  String
+  startAt    DateTime // timezone = master.timezone
+  endAt      DateTime
+  status     AppointmentStatus  @default(PENDING)
+  priceRub   Int // snapshot of the service price at booking time
+  source     AppointmentSource  @default(ONLINE)
+  cancelToken String           @unique @default(cuid()) // allows cancel link without login
+  clientNote String?
+  masterNote String?
+  createdAt  DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
+
+  master    MasterProfile @relation(fields: [masterId], references: [id], onDelete: Cascade)
+  client    Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  service   Service       @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  reminders Reminder[]
+
+  @@unique([masterId, startAt]) // hard double-booking guard (same slot)
+  @@index([masterId, startAt, status]) // calendar queries
+  @@index([masterId, status])          // dashboard lists
+  @@index([clientId])
+}
+
+model Reminder {
+  id            String         @id @default(cuid())
+  appointmentId String
+  type          ReminderType
+  sendAt        DateTime
+  sentAt        DateTime?
+  status        ReminderStatus @default(PENDING)
+  error         String?
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@unique([appointmentId, type]) // idempotent reminders
+  @@index([status, sendAt]) // cron scan window
+}
+
+model Payment {
+  id                String        @id @default(cuid())
+  masterId          String
+  period            PaymentPeriod
+  amountRub         Int
+  status            PaymentStatus @default(PENDING)
+  providerPaymentId String?       @unique // YooKassa payment id, idempotency key
+  periodStart       DateTime
+  periodEnd         DateTime
+  paidAt            DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  master MasterProfile @relation(fields: [masterId], references: [id], onDelete: Cascade)
+
+  @@index([masterId, createdAt])
+  @@index([status, createdAt])
+}
+
+// Current subscription state: auto-renewal flag and saved payment method
+// for YooKassa recurring payments (stage 6).
+model Subscription {
+  id              String   @id @default(cuid())
+  masterId        String   @unique
+  autoRenew       Boolean  @default(true)
+  paymentMethodId String? // saved YooKassa payment method id
+  updatedAt       DateTime @updatedAt
+
+  master MasterProfile @relation(fields: [masterId], references: [id], onDelete: Cascade)
+}
