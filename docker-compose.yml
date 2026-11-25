@@ -1,0 +1,42 @@
+name: okoshko
+
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
+      MYSQL_DATABASE: okoshko
+      MYSQL_USER: okoshko
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-okoshko}
+    volumes:
+      - dbdata:/var/lib/mysql
+    ports:
+      # Exposed for local prisma CLI / studio. Remove on production VPS.
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootpass}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Overrides .env so the app always talks to the compose network host.
+      DATABASE_URL: mysql://okoshko:${MYSQL_PASSWORD:-okoshko}@db:3306/okoshko
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  dbdata:
